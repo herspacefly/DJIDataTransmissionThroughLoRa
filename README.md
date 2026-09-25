@@ -1,57 +1,154 @@
-# 无人机 2.4 GHz 链路抗干扰测试
+# UAV-Methane-Telemetry
 
-本目录包含一对仅依赖 `pyserial` 的 Python 3.8 脚本，用于通过 E28-2G4T20SX 透明串口链路发送编号测试帧并统计接收丢包。
+无人机甲烷浓度实时无线回传系统。基于大疆 M400 无人机 + Aeris Mira Pico 气体监测仪 + 亿佰特 E28 LoRa 无线串口模块，将空中采集的甲烷浓度实时传回地面电脑并可视化记录。
 
-两端波特率被强制固定为 `9600`。不要提高此值：模块空中速率为 10 kbps，较高串口速率可能造成模块缓冲区溢出和非无线原因的丢包。
+---
 
-## 依赖安装
+## 工作原理
 
-妙算 3（无 root 权限）：
+E28 LoRa 模块为**透明传输**——对两端程序而言它就是一根串口线，无线电部分完全由模块完成。因此机载端与地面端的代码都只需读写串口，无需任何网络协议。
+
+```
+Mira Pico（采集 + 运行桥接程序）
+        │ USB
+        ↓
+   E28 机载端  ～～～ 2.4GHz 无线电 ～～～  E28 地面端
+                                              │ USB
+                                              ↓
+                                      Windows 电脑（地面站）
+```
+
+一帧数据的完整旅程：传感器采集 → Pico 输出原始行（约 134 字节）→ 桥接程序提取时间戳/CH4/H2O/C2H6 并加序号 → 写入 LoRa 串口 → 调制发射 → 地面解调还原 → 地面站解析、显示、存盘。
+
+> 帧格式：`$MIRA,<序号>,<时间戳>,<CH4>,<H2O>,<C2H6>`（约 45 字节，1 Hz）
+>
+> 加序号的原因：LoRa 广播式传输无 ACK 确认，只有靠序号连续性才能统计丢包率——这是量化无人机图传干扰程度的唯一依据。
+
+完整原理说明见 [当前方案说明与操作手册](./当前方案说明与操作手册.md)。
+
+---
+
+## 硬件清单
+
+| 设备 | 说明 |
+|---|---|
+| 大疆 Matrice 400 | 无人机平台 |
+| Aeris Mira Pico | 甲烷气体监测仪（Debian 系统，可 SSH、可运行 Python） |
+| 亿佰特 E28-2G4TBM-01 × 2 | 2.4GHz LoRa 无线串口模块评估板，**必须成对使用** |
+| Windows 电脑 | 运行地面站 |
+
+---
+
+## 文件说明
+
+| 文件 | 运行位置 | 说明 |
+|---|---|---|
+| `pico_ch4_bridge.py` | Pico | 读数据口 → 提取字段 → 加序号 → 写 LoRa 串口 |
+| `mira_ground_station.py` | Windows | 地面站 GUI：三气体实时曲线 / 数值卡 / CSV 存盘 / 丢包统计 / 终端遥控 |
+| `启动地面站.bat` | Windows | 一键启动（自动探测 Python、自动安装依赖） |
+
+文档：[操作手册](./当前方案说明与操作手册.md) · [开发日志](./甲烷监测无人机无线传输开发日志.md) · [项目背景](./甲烷监测无人机无线传输项目背景说明.md)
+
+---
+
+## 快速开始
+
+### 1. 硬件连接
+
+**两块 E28 都必须先拧好天线，再插 USB。** 天线未接时发射会烧毁功放，且损坏是隐性的（模块仍能识别，只是发不出去）。
+
+地面端建议插黑色 USB 2.0 口（USB 3.0 噪声落在 2.4GHz 会干扰接收），并用延长线拉离主机。
+
+### 2. 电脑端依赖
+
+```powershell
+pip install pyserial matplotlib
+```
+
+### 3. Pico 端部署
+
+将 `pico_ch4_bridge.py` 放到 `/home/debian/`，用 systemd 设置开机自启：
+
+```ini
+# /etc/systemd/system/pico-lora.service
+[Unit]
+Description=Pico to LoRa Bridge
+After=multi-user.target
+
+[Service]
+Type=simple
+User=debian
+ExecStart=/usr/bin/python3 /home/debian/pico_ch4_bridge.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ```bash
-python3 -m pip install --user pyserial
+sudo systemctl daemon-reload
+sudo systemctl enable pico-lora.service
+sudo systemctl start pico-lora.service
 ```
 
-Windows：
+### 4. SSH 免密（供地面站远程控制使用）
 
 ```powershell
-python -m pip install pyserial
+ssh-keygen
+type $env:USERPROFILE\.ssh\id_rsa.pub | ssh debian@<Pico的IP> "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"
 ```
 
-## 传输与运行
-
-若脚本在 Windows 本机，传输机载发送端脚本的示例：
-
-```powershell
-scp .\beacon_tx.py dji@192.168.42.140:/home/dji/Data_transaction/
-```
-
-先在 Windows 地面端启动接收脚本。将 `COM3` 替换成模块实际端口：
-
-```powershell
-cd C:\path\to\scripts
-python .\beacon_rx.py --port COM3 --baud 9600 --expected-frames 120 --idle-timeout 5
-```
-
-然后在妙算 3 启动发送脚本：
+Pico 上执行：
 
 ```bash
-cd /home/dji/Data_transaction
-python3 beacon_tx.py --port /dev/ttyUSB0 --baud 9600 --frequency 2 --duration 60
+echo "debian ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/debian
 ```
 
-发送端从 `#0001` 递增发送，默认 60 秒、2 Hz，对应 120 个预期帧。接收端在收到首个有效帧后，收齐 120 帧会立即结束；若 5 秒没有新的有效帧，也会自动写入 CSV 并输出统计。按 `Ctrl+C` 可手动结束接收并保留当前统计。
+### 5. 启动地面站
 
-接收 CSV 默认命名为 `beacon_rx_YYYYMMDD_HHMMSS.csv`，包含本机接收时间、原始帧、解析出的序号和发送端时间戳。重复帧、越界帧、损坏帧和串口断连时未完成的帧都会保留在 CSV 中并带状态标记。
+双击 `启动地面站.bat`。**运行前请关闭 PuTTY**——串口不能同时被两个程序占用。
 
-## 结果判读
+选择 E28 对应的 COM 口，波特率保持 **9600**，点击「连接」。
 
-先以无人机关闭或图传关闭状态，在相同地点、距离、天线方向和模块参数下测量基线。每种工况至少重复 3 轮，每轮默认 120 帧；以绝对丢包率和相对基线增量中较严重的结果判定。
+数据会自动存入程序目录下 `data/` 文件夹，每 30 分钟新建一个 CSV 文件。
 
-| 等级 | 判定条件 | 建议 |
-| --- | --- | --- |
-| 正常 | 丢包率 `<= 1%`、较基线增加 `<= 1` 个百分点，且最大连续丢包不超过 1 帧 | 记录为基线，继续测试不同飞行/图传状态。 |
-| 有干扰 | 丢包率 `(1%, 5%]`，或较基线增加 `(1, 5]` 个百分点，或连续丢失 2-3 帧 | 保持测试条件不变复测；调整天线间距、安装位置和极化方向。 |
-| 严重干扰 | 丢包率 `> 5%`，或较基线增加 `> 5` 个百分点，或连续丢失至少 4 帧 | 停止将该结果用于可靠控制链路；选择合规且避开图传/Wi-Fi 的信道或频段后重新建立基线。 |
+### 6. 结束工作
 
-默认 120 帧时，1 帧丢失约为 `0.83%`，7 帧丢失约为 `5.83%`。因此至少 7 帧丢失即可按严重干扰处理。
+切到「终端 / 远程控制」标签页 → 点「停止采集」停止发送，点「正常关机」安全关闭 Pico。
+
+> **切勿长按电源键强制断电。** Pico 是精密仪器且存有采集数据，强制断电可能损坏文件系统。
+
+---
+
+## 关键参数
+
+| 项目 | 值 |
+|---|---|
+| 串口波特率 | **9600（不要修改）** |
+| 空中速率 | 10 kbps |
+| 单帧上限 | 121 字节（实际约 45 字节） |
+| 工作频段 | 2400–2500 MHz（默认信道 2413 MHz） |
+| 发射功率 | 20 dBm |
+| Pico 数据口 | `/dev/ttyUSB_RS232` |
+| Pico LoRa 口 | `/dev/ttyUSB_LORA` |
+
+> **不要提高波特率。** 空中速率仅约 1250 字节/秒，串口速率超过它会导致模块缓冲区溢出，造成疯狂丢包，且症状与"被干扰"完全相同，极易误导排查。
+
+---
+
+## 注意事项
+
+- **天线必须先拧再上电**，换天线前先断电
+- 两块模块测试时保持 **2~3 米以上**，过近会因接收机饱和导致"近距堵死"
+- 串口设备一律使用别名（`ttyUSB_RS232` / `ttyUSB_LORA`），**不要写 `ttyUSB0/1/2`**，端口号会随插拔顺序漂移
+- Pico 设置开机自启后为**开机即连续发射**，每次开机前务必目视检查天线
+
+---
+
+## 待办
+
+- [ ] **干扰测试**：M400 的 O4 图传工作频段（2.400–2.4835 GHz）与 E28 完全重叠，需实测飞机开机 + 图传工作时的丢包率。判读标准见[操作手册](./当前方案说明与操作手册.md)
+- [ ] 机载天线安装位置对比（贴机身 / 伸出机臂 / 朝下）
+- [ ] Pico 供电续航实测（LoRa 由 Pico 取电）
+- [ ] 实际拉距测试
