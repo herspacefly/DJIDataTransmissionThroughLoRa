@@ -107,6 +107,28 @@ class GroundStation:
 
     # ---------------- UI ----------------
     def build_ui(self, parent):
+        # ---- 外层滚动容器：内容超出窗口时可上下滚动 ----
+        wrap = ttk.Frame(parent)
+        wrap.pack(fill=tk.BOTH, expand=True)
+
+        self.scroll_canvas = tk.Canvas(wrap, highlightthickness=0)
+        vsb = ttk.Scrollbar(wrap, orient=tk.VERTICAL,
+                            command=self.scroll_canvas.yview)
+        self.scroll_canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        inner = ttk.Frame(self.scroll_canvas)
+        self.scroll_win = self.scroll_canvas.create_window(
+            (0, 0), window=inner, anchor='nw')
+        inner.bind('<Configure>',
+                   lambda e: self.scroll_canvas.configure(
+                       scrollregion=self.scroll_canvas.bbox('all')))
+        self.scroll_canvas.bind('<Configure>', self._on_scroll_canvas_resize)
+
+        # 后续所有控件改为放进可滚动区域
+        parent = inner
+
         top = ttk.Frame(parent, padding=6)
         top.pack(fill=tk.X)
 
@@ -180,7 +202,7 @@ class GroundStation:
                 ln, = ax.plot([], [], color=color, linewidth=1.2)
                 self.axes[key] = ax
                 self.lines[key] = ln
-            self.axes[GASES[-1][0]].set_xlabel('时间 (s)', fontsize=8)
+            self.axes[GASES[-1][0]].set_xlabel('Time (s)', fontsize=8)
             self.fig.tight_layout()
             self.canvas = FigureCanvasTkAgg(self.fig, master=right)
             self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -188,9 +210,14 @@ class GroundStation:
             tk.Label(right, text='未安装 matplotlib\n\n如需曲线请运行:\npip install matplotlib',
                      font=FONT, fg='gray', justify=tk.CENTER).pack(expand=True)
 
-        bottom = ttk.LabelFrame(parent, text='原始数据', padding=4)
-        bottom.pack(fill=tk.BOTH, expand=False)
-        self.log = scrolledtext.ScrolledText(bottom, height=9, font=('Consolas', 9))
+        # 原始数据区：固定高度 280px（窗口高 760 的约 37%），曲线区相应变小
+        bottom_wrap = tk.Frame(parent, height=280)
+        bottom_wrap.pack(fill=tk.X, expand=False, padx=8, pady=(0, 4))
+        bottom_wrap.pack_propagate(False)
+
+        bottom = ttk.LabelFrame(bottom_wrap, text='原始数据', padding=4)
+        bottom.pack(fill=tk.BOTH, expand=True)
+        self.log = scrolledtext.ScrolledText(bottom, font=('Consolas', 9))
         self.log.pack(fill=tk.BOTH, expand=True)
 
         bar = ttk.Frame(parent, padding=4)
@@ -201,6 +228,37 @@ class GroundStation:
         ttk.Button(bar, text='打开数据文件夹',
                    command=self.open_data_dir).pack(side=tk.LEFT, padx=4)
         ttk.Button(bar, text='重置统计', command=self.reset_stats).pack(side=tk.LEFT)
+
+        # 滚轮滚动（跳过文本框，保留其自身滚动）
+        self._bind_mousewheel(inner)
+        self.scroll_canvas.bind('<MouseWheel>', self._on_mousewheel)
+
+    # ---------------- 滚动支持 ----------------
+    def _on_scroll_canvas_resize(self, event):
+        try:
+            self.scroll_canvas.itemconfig(self.scroll_win, width=event.width)
+        except Exception:
+            pass
+
+    def _on_mousewheel(self, event):
+        try:
+            self.scroll_canvas.yview_scroll(
+                int(-1 * (event.delta / 120)), 'units')
+        except Exception:
+            pass
+        return 'break'
+
+    def _bind_mousewheel(self, widget):
+        try:
+            if not isinstance(widget, (tk.Text, tk.Entry, ttk.Combobox)):
+                widget.bind('<MouseWheel>', self._on_mousewheel, add='+')
+        except Exception:
+            pass
+        try:
+            for child in widget.winfo_children():
+                self._bind_mousewheel(child)
+        except Exception:
+            pass
 
     # ---------------- 终端 / 远程控制 ----------------
     def build_terminal(self, parent):
