@@ -30,12 +30,28 @@ import math
 import re
 from tkinter import font as tkfont
 
+TERMINAL_UNAVAILABLE_REASON = ''
 try:
+    from importlib.metadata import version
     from winpty import PtyProcess
     import pyte
+    if version('pywinpty').split('.')[0] != '2' or version('pyte').split('.')[:2] != ['0', '8']:
+        raise RuntimeError('pywinpty 或 pyte 版本不兼容')
     HAS_PTY = os.name == 'nt'
-except ImportError:
+    if not HAS_PTY:
+        TERMINAL_UNAVAILABLE_REASON = '交互终端仅支持 Windows'
+except Exception as e:
+    # 可选模块可能因缺包、DLL 加载或版本问题失败，均不阻止监测启动。
     HAS_PTY = False
+    TERMINAL_UNAVAILABLE_REASON = str(e)
+
+TERMINAL_UNAVAILABLE_MESSAGE = (
+    '终端不可用：交互终端依赖尚未就绪。\n'
+    '串口接收、气体数值、浓度曲线和 CSV 保存不受终端依赖影响。\n'
+    '请在启动地面站的 Python 环境中安装：\n'
+    'python -m pip install "pywinpty>=2,<3" "pyte>=0.8,<0.9"\n'
+    '安装完成后重启地面站。\n'
+    f'原因：{TERMINAL_UNAVAILABLE_REASON}\n')
 
 try:
     import matplotlib
@@ -105,12 +121,17 @@ class EmbeddedTerminal(ttk.Frame):
         self.resize_job = None
         self.screen = None
         self.stream = None
-        self.status = tk.StringVar(value='未启动')
+        self.status = tk.StringVar(value='未启动' if HAS_PTY else '终端不可用')
+        self.controls = []
         bar = ttk.Frame(self)
         bar.pack(fill=tk.X)
-        ttk.Button(bar, text='本地终端', command=self.start_local).pack(side=tk.LEFT)
+        local_button = ttk.Button(bar, text='本地终端', command=self.start_local)
+        local_button.pack(side=tk.LEFT)
+        self.controls.append(local_button)
         for label, key in [('Ctrl+C 中断', '\x03'), ('Ctrl+D', '\x04'), ('Tab', '\t')]:
-            ttk.Button(bar, text=label, command=lambda k=key: self.write(k)).pack(side=tk.LEFT, padx=3)
+            button = ttk.Button(bar, text=label, command=lambda k=key: self.write(k))
+            button.pack(side=tk.LEFT, padx=3)
+            self.controls.append(button)
         ttk.Label(bar, textvariable=self.status).pack(side=tk.RIGHT)
         self.font = tkfont.Font(family='Consolas', size=10)
         self.output = scrolledtext.ScrolledText(
@@ -128,13 +149,20 @@ class EmbeddedTerminal(ttk.Frame):
         self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
         self.entry.bind('<Return>', self.send_line)
         self.entry.bind('<Control-c>', lambda e: self.write('\x03') if not self.entry.selection_present() else None)
-        ttk.Button(entry_row, text='发送', command=self.send_line).pack(side=tk.LEFT)
+        send_button = ttk.Button(entry_row, text='发送', command=self.send_line)
+        send_button.pack(side=tk.LEFT)
+        self.controls.extend((send_button, self.entry))
         self.hidden_input = tk.BooleanVar(value=False)
         ttk.Checkbutton(entry_row, text='隐藏输入', variable=self.hidden_input,
                         command=self.update_input_mode).pack(side=tk.LEFT, padx=4)
         ttk.Label(self, text='可直接点击终端输入；Ctrl+Shift+C 复制，Ctrl+V 粘贴。SSH 中 exit 返回连接结束状态。',
                   font=FONT, foreground='gray').pack(anchor=tk.W)
-        self.message('点击「SSH 登录」进入 Pico，或点击「本地终端」运行本地命令。\n')
+        if HAS_PTY:
+            self.message('点击「SSH 登录」进入 Pico，或点击「本地终端」运行本地命令。\n')
+        else:
+            for control in self.controls:
+                control.configure(state=tk.DISABLED)
+            self.message(TERMINAL_UNAVAILABLE_MESSAGE)
         self.poll_job = self.after(60, self.poll)
 
     def message(self, text):
@@ -158,8 +186,8 @@ class EmbeddedTerminal(ttk.Frame):
 
     def start(self, argv, label):
         if not HAS_PTY:
-            self.message('交互终端需要 Windows，以及 pywinpty 和 pyte。\n'
-                         '请运行：pip install "pywinpty>=2,<3" "pyte>=0.8,<0.9"\n')
+            self.status.set('终端不可用')
+            self.message(TERMINAL_UNAVAILABLE_MESSAGE)
             return False
         self.stop()
         self.generation += 1
@@ -384,7 +412,7 @@ class GroundStation:
         self.tab_main = ttk.Frame(self.nb)
         self.tab_term = ttk.Frame(self.nb)
         self.nb.add(self.tab_main, text='  监测  ')
-        self.nb.add(self.tab_term, text='  终端 / 远程控制  ')
+        self.nb.add(self.tab_term, text='  终端 / 远程控制  ' if HAS_PTY else '  终端 / 远程控制（不可用）  ')
 
         self.build_ui(self.tab_main)
         self.build_terminal(self.tab_term)
@@ -446,6 +474,11 @@ class GroundStation:
         self.status = tk.StringVar(value='未连接')
         ttk.Label(top, textvariable=self.status, font=FONT,
                   foreground='gray').pack(side=tk.RIGHT)
+
+        if not HAS_PTY:
+            ttk.Label(parent, text='终端不可用：依赖尚未就绪。数据接收、数值、曲线和 CSV 保存可正常使用。'
+                                  '安装终端依赖后重启程序。',
+                      font=FONT, foreground='#a05200', wraplength=950).pack(fill=tk.X, padx=8)
 
         mid = ttk.Frame(parent, padding=6)
         mid.pack(fill=tk.BOTH, expand=True)
@@ -564,6 +597,7 @@ class GroundStation:
 
         acts = ttk.LabelFrame(parent, text='常用远程操作（无需直接关机）', padding=6)
         acts.pack(fill=tk.X, padx=8, pady=4)
+        terminal_state = tk.NORMAL if HAS_PTY else tk.DISABLED
         for label, cmd in [
             ('停止采集', 'sudo systemctl stop pico-lora'),
             ('启动采集', 'sudo systemctl start pico-lora'),
@@ -572,11 +606,11 @@ class GroundStation:
             ('重启 Pico', 'sudo reboot'),
             ('正常关机', 'sudo shutdown -h now'),
         ]:
-            ttk.Button(acts, text=label,
+            ttk.Button(acts, text=label, state=terminal_state,
                        command=lambda c=cmd: self.run_remote(c)).pack(side=tk.LEFT, padx=3)
-        ttk.Button(acts, text='SSH 登录',
+        ttk.Button(acts, text='SSH 登录', state=terminal_state,
                    command=self.ssh_login).pack(side=tk.LEFT, padx=(14, 3))
-        ttk.Button(acts, text='查网关 IP',
+        ttk.Button(acts, text='查网关 IP', state=terminal_state,
                    command=self.run_local_ipconfig).pack(side=tk.LEFT, padx=3)
 
         term = ttk.LabelFrame(parent, text='交互终端', padding=4)
@@ -600,6 +634,9 @@ class GroundStation:
         return h
 
     def run_remote(self, remote_cmd):
+        if not HAS_PTY:
+            self.terminal.message(TERMINAL_UNAVAILABLE_MESSAGE)
+            return
         h = self.host()
         if not h:
             return
@@ -619,6 +656,9 @@ class GroundStation:
         terminal.start(['ssh', '-tt', '-o', 'ConnectTimeout=10', h, remote_cmd], f'SSH {h}')
 
     def ssh_login(self):
+        if not HAS_PTY:
+            self.terminal.message(TERMINAL_UNAVAILABLE_MESSAGE)
+            return
         h = self.host()
         if not h:
             return
@@ -626,6 +666,9 @@ class GroundStation:
 
     def run_local_ipconfig(self):
         """查本机默认网关 —— 电脑连 Pico WiFi 时，网关通常就是 Pico 自身 IP"""
+        if not HAS_PTY:
+            self.terminal.message(TERMINAL_UNAVAILABLE_MESSAGE)
+            return
         cmd = ("powershell -NoProfile -Command \"Get-NetRoute -DestinationPrefix "
                "'0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1 "
                "-ExpandProperty NextHop\"")

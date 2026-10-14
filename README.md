@@ -53,7 +53,11 @@ python -m pip install pyserial matplotlib "pywinpty>=2,<3" "pyte>=0.8,<0.9"
 python .\mira_ground_station.py
 ```
 
-也可以双击 `启动地面站.bat`。当前批处理只会尝试安装 `pyserial` 和 `matplotlib`，**不会安装 `pywinpty` 和 `pyte`**，交互终端依赖需先按上面的命令安装。
+也可以双击 `启动地面站.bat`。脚本会选择可用的 Python 3，在同一个解释器环境中检查上述四个依赖，并自动安装缺失或版本不兼容的包。若缺少 pip，会先尝试用 `ensurepip` 安装，安装后再次检查。`pyserial` 或 `matplotlib` 安装失败时停止启动；可选终端依赖 `pywinpty`、`pyte` 安装失败时，明确提示终端不可用，仍启动数据监测。首次安装依赖需要网络连接。
+
+终端依赖缺失、加载失败或版本不兼容时，监测页显示提示，终端标签标为“不可用”，SSH、本地终端和远程操作按钮禁用。终端页提供安装命令。串口接收、气体数值、浓度曲线和 CSV 保存独立运行；补齐终端依赖后重启地面站即可使用终端。
+
+启动脚本也会检查 `tkinter`。它属于 Python 的 Tcl/Tk 组件，缺失时需安装带 Tcl/Tk 的 Python，不能通过 pip 安装。OpenSSH 客户端仍由 Windows 提供，不在 pip 依赖安装范围内。
 
 ### Pico 的 Debian
 
