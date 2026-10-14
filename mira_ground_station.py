@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 MIRA Pico 甲烷监测地面站 (Windows)
-替代 PuTTY 的专用接收软件：三气体实时曲线 / 数值卡 / 自动存 CSV / 丢包统计
+替代 PuTTY 的专用接收软件：三气体实时曲线 / 数值卡 / 经纬度 / 自动存 CSV / 丢包统计
 
 【数据输出】
   自动在程序所在文件夹下创建 data/ 子目录
@@ -11,13 +11,13 @@ MIRA Pico 甲烷监测地面站 (Windows)
 
 【运行前】
   pip install pyserial matplotlib
+  内置交互终端还需：pip install "pywinpty>=2,<3" "pyte>=0.8,<0.9"
   注意：运行本程序前请先关闭 PuTTY，串口不能被两个程序同时占用
 """
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog, messagebox
 import serial
-import subprocess
 import serial.tools.list_ports
 import threading
 import queue
@@ -26,6 +26,16 @@ import csv
 import os
 import sys
 import datetime
+import math
+import re
+from tkinter import font as tkfont
+
+try:
+    from winpty import PtyProcess
+    import pyte
+    HAS_PTY = os.name == 'nt'
+except ImportError:
+    HAS_PTY = False
 
 try:
     import matplotlib
@@ -40,6 +50,8 @@ FONT = ('Microsoft YaHei', 9)
 FONT_BIG = ('Microsoft YaHei', 13, 'bold')
 MAX_POINTS = 300            # 曲线最多显示的点数
 ROTATE_SEC = 30 * 60        # CSV 轮转间隔：30 分钟
+MAX_FRAME_BYTES = 121
+POLL_BATCH = 100            # 每轮最多处理 100 帧，给界面事件留出时间
 
 # 三种气体的显示配置：(键, 中文名, 单位, 颜色)
 GASES = [
@@ -56,6 +68,281 @@ def app_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def coordinate(value):
+    """兼容 nan、No Data、空值和旧帧；CSV 中缺失坐标统一为 nan。"""
+    value = value.strip()
+    try:
+        if math.isfinite(float(value)):
+            return value
+    except ValueError:
+        pass
+    return 'nan'
+
+
+def sensor_time(value):
+    for fmt in ('%m/%d/%Y %H:%M:%S.%f', '%m/%d/%Y %H:%M:%S'):
+        try:
+            return datetime.datetime.strptime(value, fmt)
+        except ValueError:
+            pass
+    raise ValueError('invalid instrument timestamp')
+
+
+def gas_value(value):
+    if value.lower() in ('', 'nan', 'no data'):
+        return 'nan'
+    return value if math.isfinite(float(value)) else 'nan'
+
+
+class EmbeddedTerminal(ttk.Frame):
+    """Windows 伪终端 + VT 屏幕；SSH 的密码、提示符和按键均经过真实终端。"""
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.proc = None
+        self.events = queue.Queue()
+        self.generation = 0
+        self.closed = False
+        self.resize_job = None
+        self.screen = None
+        self.stream = None
+        self.status = tk.StringVar(value='未启动')
+        bar = ttk.Frame(self)
+        bar.pack(fill=tk.X)
+        ttk.Button(bar, text='本地终端', command=self.start_local).pack(side=tk.LEFT)
+        for label, key in [('Ctrl+C 中断', '\x03'), ('Ctrl+D', '\x04'), ('Tab', '\t')]:
+            ttk.Button(bar, text=label, command=lambda k=key: self.write(k)).pack(side=tk.LEFT, padx=3)
+        ttk.Label(bar, textvariable=self.status).pack(side=tk.RIGHT)
+        self.font = tkfont.Font(family='Consolas', size=10)
+        self.output = scrolledtext.ScrolledText(
+            self, font=self.font, height=24, wrap=tk.NONE, bg='#1e1e1e',
+            fg='#d4d4d4', insertbackground='white', state=tk.DISABLED)
+        self.output.pack(fill=tk.BOTH, expand=True)
+        self.output.tag_configure('cursor', background='#666666')
+        self.output.bind('<Key>', self.on_key)
+        self.output.bind('<<Paste>>', self.paste)
+        self.output.bind('<Configure>', self.schedule_resize)
+        entry_row = ttk.Frame(self)
+        entry_row.pack(fill=tk.X, pady=4)
+        ttk.Label(entry_row, text='命令 / 输入:').pack(side=tk.LEFT)
+        self.entry = ttk.Entry(entry_row, font=self.font)
+        self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        self.entry.bind('<Return>', self.send_line)
+        self.entry.bind('<Control-c>', lambda e: self.write('\x03') if not self.entry.selection_present() else None)
+        ttk.Button(entry_row, text='发送', command=self.send_line).pack(side=tk.LEFT)
+        self.hidden_input = tk.BooleanVar(value=False)
+        ttk.Checkbutton(entry_row, text='隐藏输入', variable=self.hidden_input,
+                        command=self.update_input_mode).pack(side=tk.LEFT, padx=4)
+        ttk.Label(self, text='可直接点击终端输入；Ctrl+Shift+C 复制，Ctrl+V 粘贴。SSH 中 exit 返回连接结束状态。',
+                  font=FONT, foreground='gray').pack(anchor=tk.W)
+        self.message('点击「SSH 登录」进入 Pico，或点击「本地终端」运行本地命令。\n')
+        self.poll_job = self.after(60, self.poll)
+
+    def message(self, text):
+        if self.proc is not None:
+            # 应用提示不插进 VT 数据流，避免改变 SSH 的屏幕和光标位置。
+            self.status.set(text.strip())
+            return
+        if self.stream:
+            self.stream.feed(text.replace('\n', '\r\n'))
+            self.render()
+        else:
+            self.output.configure(state=tk.NORMAL)
+            self.output.insert(tk.END, text)
+            self.output.configure(state=tk.DISABLED)
+            self.output.see(tk.END)
+
+    def dimensions(self):
+        columns = max(40, (self.output.winfo_width() - 24) // max(1, self.font.measure('M')))
+        rows = max(10, (self.output.winfo_height() - 8) // max(1, self.font.metrics('linespace')))
+        return rows, columns
+
+    def start(self, argv, label):
+        if not HAS_PTY:
+            self.message('交互终端需要 Windows，以及 pywinpty 和 pyte。\n'
+                         '请运行：pip install "pywinpty>=2,<3" "pyte>=0.8,<0.9"\n')
+            return False
+        self.stop()
+        self.generation += 1
+        generation = self.generation
+        rows, columns = self.dimensions()
+        self.screen = pyte.HistoryScreen(columns, rows, history=1000)
+        self.screen.write_process_input = self.write
+        self.stream = pyte.Stream(self.screen)
+        self.entry.delete(0, tk.END)
+        self.hidden_input.set(False)
+        self.update_input_mode()
+        try:
+            env = dict(os.environ, TERM='xterm-256color')
+            self.proc = PtyProcess.spawn(argv, cwd=app_dir(), env=env, dimensions=(rows, columns))
+        except Exception as e:
+            self.status.set('启动失败')
+            self.message(f'终端启动失败: {e}\n')
+            return False
+        self.status.set(label)
+        threading.Thread(target=self.read_output, args=(self.proc, generation), daemon=True).start()
+        self.render()
+        self.output.focus_set()
+        return True
+
+    def start_local(self):
+        return self.start(['cmd.exe', '/Q'], '本地 Windows 终端')
+
+    def read_output(self, proc, generation):
+        try:
+            while True:
+                data = proc.read()
+                if data:
+                    self.events.put((generation, 'data', data))
+        except EOFError:
+            pass
+        except Exception as e:
+            self.events.put((generation, 'error', str(e)))
+        finally:
+            self.events.put((generation, 'exit', None))
+
+    def write(self, text):
+        if self.proc is None:
+            return 'break'
+        try:
+            self.proc.write(text)
+        except Exception as e:
+            self.message(f'终端输入失败: {e}\n')
+        return 'break'
+
+    def send_line(self, event=None):
+        text = self.entry.get()
+        self.entry.delete(0, tk.END)
+        self.write(text + '\r')  # 空输入也应传送 Enter；不把密码或命令额外写入日志
+        return 'break'
+
+    def send_command(self, command):
+        if self.proc is None and not self.start_local():
+            return
+        self.write(command + '\r')
+
+    def on_key(self, event):
+        control = bool(event.state & 0x4)
+        shift = bool(event.state & 0x1)
+        key = event.keysym
+        if control and key.lower() == 'c' and shift:
+            try:
+                self.clipboard_clear()
+                self.clipboard_append(self.output.get(tk.SEL_FIRST, tk.SEL_LAST))
+            except tk.TclError:
+                pass
+            return 'break'
+        if control and key.lower() == 'v':
+            return self.paste()
+        if control and len(key) == 1 and 'a' <= key.lower() <= 'z':
+            return self.write(chr(ord(key.lower()) - ord('a') + 1))
+        mapping = {'Return': '\r', 'BackSpace': '\x7f', 'Tab': '\t', 'Escape': '\x1b',
+                   'Up': '\x1b[A', 'Down': '\x1b[B', 'Right': '\x1b[C', 'Left': '\x1b[D',
+                   'Home': '\x1b[H', 'End': '\x1b[F', 'Delete': '\x1b[3~',
+                   'Prior': '\x1b[5~', 'Next': '\x1b[6~'}
+        if key in mapping:
+            return self.write(mapping[key])
+        if event.char and event.char.isprintable():
+            return self.write(event.char)
+        return 'break'
+
+    def paste(self, event=None):
+        try:
+            text = self.clipboard_get().replace('\r\n', '\n').replace('\n', '\r')
+            self.write(text)
+        except tk.TclError:
+            pass
+        return 'break'
+
+    def update_input_mode(self):
+        self.entry.configure(show='*' if self.hidden_input.get() else '')
+
+    def render(self):
+        if not self.screen:
+            return
+        # 缩小窗口后 pyte 可能暂时保留旧光标位置。
+        self.screen.cursor.y = min(max(0, self.screen.cursor.y), self.screen.lines - 1)
+        self.screen.cursor.x = min(max(0, self.screen.cursor.x), self.screen.columns - 1)
+        history = [''.join(line[x].data for x in range(self.screen.columns))
+                   for line in self.screen.history.top]
+        lines = history + self.screen.display
+        self.output.configure(state=tk.NORMAL)
+        self.output.delete('1.0', tk.END)
+        self.output.insert('1.0', '\n'.join(lines))
+        # VT 光标用屏幕列数，Tk 用字符数；中文等双宽字符需要换算。
+        cursor_column = len(''.join(self.screen.buffer[self.screen.cursor.y][x].data
+                                  for x in range(self.screen.cursor.x)))
+        cursor = f'{len(history) + self.screen.cursor.y + 1}.{cursor_column}'
+        self.output.tag_add('cursor', cursor, cursor + '+1c')
+        self.output.configure(state=tk.DISABLED)
+        self.output.see(cursor)
+        prompt = self.screen.display[self.screen.cursor.y].rstrip().lower()
+        if re.search(r'(password|passphrase|密码).*[:：]\s*$', prompt):
+            self.hidden_input.set(True)
+            self.update_input_mode()
+        elif self.hidden_input.get() and (prompt.endswith(('$', '#', '>'))):
+            self.hidden_input.set(False)
+            self.update_input_mode()
+
+    def poll(self):
+        changed = False
+        try:
+            for _ in range(POLL_BATCH):
+                generation, kind, data = self.events.get_nowait()
+                if generation != self.generation:
+                    continue
+                if kind == 'data':
+                    self.stream.feed(data)
+                    changed = True
+                elif kind == 'error':
+                    self.message(f'终端读取失败: {data}\n')
+                elif kind == 'exit':
+                    self.status.set('会话已结束；可重新登录或打开本地终端')
+        except queue.Empty:
+            pass
+        except Exception as e:
+            self.status.set(f'终端显示异常: {e}')
+        finally:
+            try:
+                if changed:
+                    self.render()
+            except Exception as e:
+                self.status.set(f'终端显示异常: {e}')
+            if not self.closed:
+                self.poll_job = self.after(60, self.poll)
+
+    def schedule_resize(self, event=None):
+        if self.resize_job:
+            self.after_cancel(self.resize_job)
+        self.resize_job = self.after(150, self.resize)
+
+    def resize(self):
+        self.resize_job = None
+        if self.proc and self.screen:
+            rows, columns = self.dimensions()
+            try:
+                self.proc.setwinsize(rows, columns)
+                self.screen.resize(lines=rows, columns=columns)
+                self.render()
+            except Exception:
+                pass  # 会话恰好退出时无需重试调整窗口
+
+    def stop(self):
+        self.generation += 1  # 已关闭会话的输出不能写入新会话
+        proc, self.proc = self.proc, None
+        if proc:
+            try:
+                proc.close(force=True)
+            except Exception:
+                pass
+
+    def close(self):
+        self.closed = True
+        self.after_cancel(self.poll_job)
+        if self.resize_job:
+            self.after_cancel(self.resize_job)
+        self.stop()
+
+
 class GroundStation:
     def __init__(self, root):
         self.root = root
@@ -64,6 +351,7 @@ class GroundStation:
 
         self.ser = None
         self.reader = None
+        self.reader_stop = None
         self.q = queue.Queue()
         self.running = False
 
@@ -72,10 +360,13 @@ class GroundStation:
         self.rx_bytes = 0
         self.first_seq = None
         self.last_seq = None
+        self.numbered_rx_count = 0
+        self.last_pico_time = None
         self.t_start = None
         self.timestamps = []
         self.series = {k: [] for k, _, _, _ in GASES}   # 各气体数值序列
         self.time_data = []
+        self.plot_dirty = False
 
         # CSV
         self.csv_file = None
@@ -84,9 +375,7 @@ class GroundStation:
         self.csv_opened_at = 0
 
         # 终端 / 远程控制
-        self.proc = None            # 本地 shell 进程
-        self.proc_q = queue.Queue()
-        self.remote_busy = False
+        self.terminal_windows = []
 
         # 标签页：监测 / 终端
         self.nb = ttk.Notebook(self.root)
@@ -102,7 +391,6 @@ class GroundStation:
 
         self.refresh_ports()
         self.root.after(100, self.poll)
-        self.root.after(120, self.poll_terminal)
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
 
     # ---------------- UI ----------------
@@ -178,7 +466,7 @@ class GroundStation:
         info = ttk.LabelFrame(left, text='状态', padding=8)
         info.pack(fill=tk.X, pady=4)
         self.info_vars = {}
-        for k in ('Pico时间', '接收帧数', '丢包率', '速率', '运行时长', '当前文件'):
+        for k in ('Pico时间', '纬度', '经度', '接收帧数', '丢包率', '速率', '运行时长', '当前文件'):
             row = ttk.Frame(info)
             row.pack(fill=tk.X)
             ttk.Label(row, text=k + ':', font=FONT, width=9).pack(side=tk.LEFT)
@@ -291,84 +579,14 @@ class GroundStation:
         ttk.Button(acts, text='查网关 IP',
                    command=self.run_local_ipconfig).pack(side=tk.LEFT, padx=3)
 
-        term = ttk.LabelFrame(parent, text='终端', padding=4)
+        term = ttk.LabelFrame(parent, text='交互终端', padding=4)
         term.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-        self.term_out = scrolledtext.ScrolledText(term, font=('Consolas', 9),
-                                                  height=16, bg='#1e1e1e',
-                                                  fg='#d4d4d4',
-                                                  insertbackground='#d4d4d4')
-        self.term_out.pack(fill=tk.BOTH, expand=True)
-
-        inp = ttk.Frame(parent, padding=(8, 0, 8, 8))
-        inp.pack(fill=tk.X)
-        self.term_in = ttk.Entry(inp, font=('Consolas', 10))
-        self.term_in.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        self.term_in.bind('<Return>', self.send_cmd)
-        ttk.Button(inp, text='发送', command=self.send_cmd).pack(side=tk.LEFT)
-
-        self.term_put('终端未启动。点「发送」或回车即自动启动本地终端。\n')
-        self.term_put('提示：远程命令依赖 Windows 自带 ssh；建议先配置免密登录（见「免密设置说明」）。\n')
+        self.terminal = EmbeddedTerminal(term)
+        self.terminal.pack(fill=tk.BOTH, expand=True)
 
     # ---- 终端基础 ----
     def term_put(self, text, autoscroll=True):
-        try:
-            self.term_out.insert(tk.END, text)
-            if int(self.term_out.index('end-1c').split('.')[0]) > 1500:
-                self.term_out.delete('1.0', '400.0')
-            if autoscroll:
-                self.term_out.see(tk.END)
-        except Exception:
-            pass
-
-    def start_shell(self):
-        if self.proc and self.proc.poll() is None:
-            return
-        kw = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                  stderr=subprocess.STDOUT, text=True,
-                  encoding='utf-8', errors='replace', bufsize=1)
-        if os.name == 'nt':
-            kw['creationflags'] = subprocess.CREATE_NO_WINDOW
-        try:
-            self.proc = subprocess.Popen(['cmd.exe'] if os.name == 'nt'
-                                         else ['/bin/bash'], **kw)
-        except Exception as e:
-            self.term_put(f'终端启动失败: {e}\n')
-            return
-        threading.Thread(target=self._shell_reader, daemon=True).start()
-        self.term_put('--- 本地终端已启动 ---\n')
-
-    def _shell_reader(self):
-        while self.proc and self.proc.poll() is None:
-            try:
-                line = self.proc.stdout.readline()
-            except Exception:
-                break
-            if not line:
-                break
-            self.proc_q.put(line)
-
-    def poll_terminal(self):
-        try:
-            while True:
-                self.term_put(self.proc_q.get_nowait())
-        except queue.Empty:
-            pass
-        self.root.after(120, self.poll_terminal)
-
-    def send_cmd(self, event=None):
-        cmd = self.term_in.get().strip()
-        if not cmd:
-            return
-        self.term_in.delete(0, tk.END)
-        self.term_put(f'> {cmd}\n')
-        self.start_shell()
-        if not self.proc:
-            return
-        try:
-            self.proc.stdin.write(cmd + '\n')
-            self.proc.stdin.flush()
-        except Exception as e:
-            self.term_put(f'写入失败: {e}\n')
+        self.terminal.message(text)
 
     # ---- 远程 ----
     def host(self):
@@ -376,50 +594,35 @@ class GroundStation:
         if not h:
             messagebox.showwarning('提示', '请先填写 Pico 地址，如 debian@192.168.1.1')
             return None
+        if h.startswith('-') or not re.fullmatch(r'[A-Za-z0-9_.@:\[\]-]+', h):
+            messagebox.showwarning('提示', '地址请填写为 debian@IP 或 debian@主机名。')
+            return None
         return h
 
     def run_remote(self, remote_cmd):
         h = self.host()
         if not h:
             return
-        self.term_put(f'\n$ ssh {h} "{remote_cmd}"\n')
-        threading.Thread(target=self._ssh_thread, args=(h, remote_cmd),
-                         daemon=True).start()
-
-    def _ssh_thread(self, host, remote_cmd):
-        kw = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                  encoding='utf-8', errors='replace')
-        if os.name == 'nt':
-            kw['creationflags'] = subprocess.CREATE_NO_WINDOW
-        args = ['ssh', '-o', 'StrictHostKeyChecking=no',
-                '-o', 'ConnectTimeout=10', host, remote_cmd]
-        try:
-            p = subprocess.Popen(args, **kw)
-            for line in p.stdout:
-                self.proc_q.put(line)
-            p.wait()
-            self.proc_q.put(f'[退出码 {p.returncode}]\n')
-        except FileNotFoundError:
-            self.proc_q.put(
-                '错误：未找到 ssh 命令。\n'
-                '请在 Windows「设置 → 应用 → 可选功能」中安装 OpenSSH 客户端，\n'
-                '或在 PowerShell 中直接手动 ssh 登录。\n')
-        except Exception as e:
-            self.proc_q.put(f'错误：{e}\n')
+        # 快捷操作单独使用终端，不打断用户正在操作的 SSH 会话。
+        window = tk.Toplevel(self.root)
+        window.title(f'Pico 远程操作：{remote_cmd}')
+        window.geometry('920x600')
+        terminal = EmbeddedTerminal(window)
+        terminal.pack(fill=tk.BOTH, expand=True)
+        self.terminal_windows.append((window, terminal))
+        def close_window():
+            terminal.close()
+            self.terminal_windows.remove((window, terminal))
+            window.destroy()
+        window.protocol('WM_DELETE_WINDOW', close_window)
+        window.update_idletasks()
+        terminal.start(['ssh', '-tt', '-o', 'ConnectTimeout=10', h, remote_cmd], f'SSH {h}')
 
     def ssh_login(self):
         h = self.host()
         if not h:
             return
-        self.term_put(f'> ssh {h}\n')
-        self.start_shell()
-        if self.proc:
-            try:
-                self.proc.stdin.write(f'ssh {h}\n')
-                self.proc.stdin.flush()
-                self.term_put('（若提示输入密码，请确保焦点在本窗口，或先配免密登录）\n')
-            except Exception as e:
-                self.term_put(f'写入失败: {e}\n')
+        self.terminal.start(['ssh', '-tt', '-o', 'ConnectTimeout=10', h], f'SSH {h}')
 
     def run_local_ipconfig(self):
         """查本机默认网关 —— 电脑连 Pico WiFi 时，网关通常就是 Pico 自身 IP"""
@@ -429,13 +632,8 @@ class GroundStation:
         self.term_put('\n> ' + cmd + '\n')
         self.term_put('（输出的 IP 通常就是 Pico 的地址，前面加上 debian@ 填入上方）\n')
         self.term_put('（若电脑同时插着网线，可能显示的是路由器网关，请以 ipconfig 为准）\n')
-        self.start_shell()
-        if self.proc:
-            try:
-                self.proc.stdin.write(cmd + '\n')
-                self.proc.stdin.flush()
-            except Exception as e:
-                self.term_put(f'写入失败: {e}\n')
+        if self.terminal.start_local():
+            self.terminal.send_command(cmd)
 
     def load_pico_host(self):
         try:
@@ -457,19 +655,20 @@ class GroundStation:
     def show_ssh_help(self):
         messagebox.showinfo(
             'SSH 免密登录设置（一次性）',
-            '在 Windows PowerShell 中执行：\n\n'
+            '内置 SSH 终端可以直接输入登录密码，免密登录是可选的。\n'
+            '如需配置免密，在本地终端中执行：\n\n'
             '1) 生成密钥（一路回车）\n'
             '   ssh-keygen\n\n'
             '2) 把公钥传到 Pico（把地址换成你的）\n'
             '   type $env:USERPROFILE\\.ssh\\id_rsa.pub | ssh debian@192.168.1.1 '
             '"mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"\n\n'
-            '3) 让 systemctl 不再要 sudo 密码（在 Pico 上执行）\n'
-            '   echo "debian ALL=(ALL) NOPASSWD:ALL" | sudo tee '
-            '/etc/sudoers.d/debian\n\n'
-            '完成后，本窗口的「停止采集 / 启动采集 / 关机」等按钮\n'
-            '就能一键执行，无需输入密码。\n\n'
-            '注：Pico 是内网设备，NOPASSWD:ALL 风险可接受；\n'
-            '若在意安全，可只放行 systemctl 与 shutdown 两个命令。')
+            '3) 测试登录（把地址换成你的）\n'
+            '   ssh debian@192.168.1.1\n\n'
+            '登录后可运行 pwd、ls、cd、cat 等 Linux 命令。\n'
+            'sudo 如需密码，直接在终端输入即可。\n'
+            '要从 Pico 复制文件到电脑，请使用本地终端中的 scp，\n'
+            '例如：scp debian@IP:/实际路径/文件.csv .\n'
+            '末尾的 . 表示本地终端的当前文件夹。')
 
     # ---------------- 串口 ----------------
     def refresh_ports(self):
@@ -521,6 +720,9 @@ class GroundStation:
                                  f'3. 当前可用端口: {avail or "无"}')
             return
         self.save_last_port(port)
+        self.q = queue.Queue()  # 新连接不接收上一连接的残留队列
+        self.reader_stop = threading.Event()
+        self.reset_stats()
         self.running = True
         self.t_start = time.time()
         self.btn_conn.config(text='断开')
@@ -528,40 +730,92 @@ class GroundStation:
         self.log_msg(f'--- 已连接 {port} @{self.baud_var.get()} ---')
         if self.save_var.get():
             self.open_csv()
-        self.reader = threading.Thread(target=self.read_loop, daemon=True)
+        self.reader = threading.Thread(
+            target=self.read_loop, args=(self.ser, self.reader_stop, self.q), daemon=True)
         self.reader.start()
 
     def disconnect(self):
         self.running = False
-        time.sleep(0.3)
-        if self.ser and self.ser.is_open:
-            self.ser.close()
+        if self.reader_stop:
+            self.reader_stop.set()
+        if self.ser:
+            try:
+                self.ser.close()
+            except Exception as e:
+                self.log_msg(f'串口关闭失败: {e}')
+        if self.reader and self.reader.is_alive():
+            self.reader.join(timeout=1)
+        self.ser = None
+        # 断开前已收齐的帧仍写入本次 CSV，不留到下一次连接。
+        while True:
+            try:
+                raw, received_at = self.q.get_nowait()
+            except queue.Empty:
+                break
+            if raw is not None:
+                self.process_raw(raw, received_at)
         self.btn_conn.config(text='连接')
         self.status.set('未连接')
         self.log_msg('--- 已断开 ---')
         self.close_csv()
 
-    def read_loop(self):
-        while self.running and self.ser and self.ser.is_open:
+    def read_loop(self, port, stop, rx_queue):
+        pending = b''
+        discarding = False
+        while not stop.is_set() and port.is_open:
             try:
-                raw = self.ser.readline()
-                if raw:
-                    self.q.put((raw, time.time()))
-            except Exception:
+                raw = port.readline(MAX_FRAME_BYTES + 1)
+                if stop.is_set() or not raw:
+                    continue
+                if discarding:
+                    discarding = not raw.endswith(b'\n')
+                    continue
+                pending += raw
+                if len(pending) > MAX_FRAME_BYTES:
+                    rx_queue.put((b'[oversized serial line discarded]\n', time.time()))
+                    pending = b''
+                    discarding = not raw.endswith(b'\n')
+                    continue
+                if pending.endswith(b'\n'):
+                    rx_queue.put((pending, time.time()))
+                    pending = b''
+            except Exception as e:
+                if not stop.is_set():
+                    rx_queue.put((None, str(e)))
                 break
 
     # ---------------- 数据处理 ----------------
     def poll(self):
         try:
-            while True:
+            for _ in range(POLL_BATCH):
                 raw, t_pc = self.q.get_nowait()
-                self.rx_bytes += len(raw)
-                self.handle(raw.decode('ascii', errors='ignore').strip(), t_pc)
+                if raw is None:
+                    self.disconnect()
+                    self.status.set('串口异常，已断开')
+                    self.log_msg(f'串口读取失败: {t_pc}')
+                    break
+                self.process_raw(raw, t_pc)
         except queue.Empty:
             pass
-        self.check_rotate()
-        self.update_info()
-        self.root.after(80, self.poll)
+        except Exception as e:
+            self.log_msg(f'数据处理失败: {e}')
+        try:
+            self.check_rotate()
+            self.update_info()
+            if self.plot_dirty:
+                self.redraw()
+                self.plot_dirty = False
+        finally:
+            self.root.after(80, self.poll)
+
+    def process_raw(self, raw, received_at):
+        self.rx_bytes += len(raw)
+        try:
+            line = raw.decode('ascii').strip()
+        except UnicodeDecodeError:
+            self.log_msg('收到非 ASCII 数据，已跳过')
+            return
+        self.handle(line, received_at)
 
     def handle(self, line, t_pc):
         if not line:
@@ -571,23 +825,54 @@ class GroundStation:
             return
 
         p = [x.strip() for x in line.split(',')]
-        if len(p) >= 6 and p[1].isdigit():          # $MIRA,seq,ts,ch4,h2o,c2h6
+        if p[0] != '$MIRA' or len(p) < 2:
+            self.log_msg(f'帧格式错误，已跳过: {line}')
+            return
+        if p[1].isdigit():                         # $MIRA,seq,ts,ch4,h2o,c2h6[,lat,lon]
+            if len(p) not in (6, 8):
+                self.log_msg(f'帧字段数错误，已跳过: {line}')
+                return
             seq = int(p[1]); ts = p[2]; vals = p[3:6]
+            coords = p[6:8]
+        elif len(p) in (5, 7):                       # $MIRA,ts,ch4,h2o,c2h6[,lat,lon]
+            seq = None; ts = p[1]; vals = p[2:5]
+            coords = p[5:7]
+        else:
+            self.log_msg(f'帧字段数错误，已跳过: {line}')
+            return
+
+        try:
+            pico_time = sensor_time(ts)
+            vals = [gas_value(v) for v in vals]
+        except ValueError:
+            self.log_msg(f'时间或浓度格式错误，已跳过: {line}')
+            return
+
+        if seq is not None:
+            if (self.last_seq is not None and seq < self.last_seq
+                    and self.last_pico_time is not None and pico_time > self.last_pico_time):
+                self.first_seq = self.last_seq = None
+                self.numbered_rx_count = 0
+                self.log_msg('--- 发送端序号重新开始，丢包统计已重新计数 ---')
             if self.first_seq is None:
                 self.first_seq = seq
-            self.last_seq = seq
-        elif len(p) >= 5:                            # $MIRA,ts,ch4,h2o,c2h6
-            seq = None; ts = p[1]; vals = p[2:5]
-        else:
-            return
+            if self.last_seq is None or seq > self.last_seq:
+                self.numbered_rx_count += 1
+                self.last_seq = seq
+                self.last_pico_time = pico_time
+
+        lat = coordinate(coords[0]) if coords else 'nan'
+        lon = coordinate(coords[1]) if len(coords) > 1 else 'nan'
 
         self.rx_count += 1
         self.timestamps.append(t_pc)
         self.log_msg(line)
 
         for (key, cn, unit, color), v in zip(GASES, vals):
-            self.vals[key].set(v)
+            self.vals[key].set(v if v != 'nan' else 'No Data')
         self.info_vars['Pico时间'].set(ts)
+        self.info_vars['纬度'].set(lat if lat != 'nan' else 'No Data')
+        self.info_vars['经度'].set(lon if lon != 'nan' else 'No Data')
 
         # 曲线数据
         self.time_data.append(t_pc - (self.t_start or t_pc))
@@ -600,13 +885,19 @@ class GroundStation:
             self.time_data.pop(0)
             for k in self.series:
                 self.series[k].pop(0)
-        self.redraw()
+        self.plot_dirty = True
 
         if self.csv_writer:
-            self.csv_writer.writerow(
-                [datetime.datetime.now().isoformat(),
-                 seq if seq is not None else '', ts] + vals)
-            self.csv_file.flush()
+            try:
+                self.csv_writer.writerow(
+                    [datetime.datetime.fromtimestamp(t_pc).isoformat(),
+                     seq if seq is not None else '', ts] + vals + [lat, lon])
+                self.csv_file.flush()
+            except (OSError, csv.Error) as e:
+                self.close_csv()
+                self.save_var.set(False)
+                self.log_msg(f'CSV 写入失败，已停止存盘，监测继续: {e}')
+                messagebox.showerror('CSV 写入失败', str(e))
 
     def redraw(self):
         if not HAS_MPL:
@@ -631,7 +922,7 @@ class GroundStation:
         if self.first_seq is not None and self.last_seq is not None:
             expected = self.last_seq - self.first_seq + 1
             if expected > 0:
-                lost = expected - self.rx_count
+                lost = max(0, expected - self.numbered_rx_count)
                 self.info_vars['丢包率'].set(
                     f'{max(0.0, lost / expected * 100):.1f}%  (丢{lost}/{expected})')
         else:
@@ -644,20 +935,25 @@ class GroundStation:
         return d
 
     def open_csv(self):
-        d = self.data_dir()
-        name = f'mira_{datetime.datetime.now():%Y%m%d_%H%M%S}.csv'
-        path = os.path.join(d, name)
+        if self.csv_file:
+            return
         try:
-            self.csv_file = open(path, 'a', newline='', encoding='utf-8')
+            d = self.data_dir()
+            name = f'mira_{datetime.datetime.now():%Y%m%d_%H%M%S_%f}.csv'
+            path = os.path.join(d, name)
+            self.csv_file = open(path, 'x', newline='', encoding='utf-8')
+            self.csv_writer = csv.writer(self.csv_file)
+            self.csv_writer.writerow(['pc_time', 'seq', 'pico_time',
+                                      'CH4_ppm', 'H2O_ppm', 'C2H6_ppb',
+                                      'Latitude', 'Longitude'])
+            self.csv_file.flush()
         except Exception as e:
-            messagebox.showerror('无法写入', f'{path}\n{e}')
+            self.close_csv()
+            messagebox.showerror('无法写入', str(e))
             self.save_var.set(False)
             return
         self.csv_path = path
-        self.csv_opened_at = time.time()
-        self.csv_writer = csv.writer(self.csv_file)
-        self.csv_writer.writerow(['pc_time', 'seq', 'pico_time',
-                                  'CH4_ppm', 'H2O_ppm', 'C2H6_ppb'])
+        self.csv_opened_at = time.monotonic()
         self.log_msg(f'CSV 记录中: {path}')
         self.info_vars['当前文件'].set(name)
 
@@ -667,7 +963,7 @@ class GroundStation:
                 self.csv_file.close()
                 self.log_msg(f'CSV 已保存: {self.csv_path}')
             except Exception:
-                pass
+                self.log_msg(f'CSV 关闭失败，文件可能未完整写入: {self.csv_path}')
         self.csv_file = None
         self.csv_writer = None
         self.csv_path = None
@@ -677,7 +973,7 @@ class GroundStation:
         """每 30 分钟切换到新文件"""
         if not self.running or not self.csv_writer:
             return
-        if time.time() - self.csv_opened_at >= ROTATE_SEC:
+        if time.monotonic() - self.csv_opened_at >= ROTATE_SEC:
             self.close_csv()
             self.open_csv()
 
@@ -707,10 +1003,15 @@ class GroundStation:
         self.rx_bytes = 0
         self.first_seq = None
         self.last_seq = None
+        self.numbered_rx_count = 0
+        self.last_pico_time = None
+        self.t_start = time.time() if self.running else None
         self.timestamps.clear()
         self.time_data.clear()
         for k in self.series:
             self.series[k].clear()
+        self.redraw()
+        self.plot_dirty = False
         self.log_msg('--- 统计已重置 ---')
 
     def export_log(self):
@@ -725,11 +1026,10 @@ class GroundStation:
 
     def on_close(self):
         self.disconnect()
-        try:
-            if self.proc and self.proc.poll() is None:
-                self.proc.terminate()
-        except Exception:
-            pass
+        self.terminal.close()
+        for window, terminal in self.terminal_windows:
+            terminal.close()
+            window.destroy()
         self.root.destroy()
 
 
