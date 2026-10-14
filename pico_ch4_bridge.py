@@ -1,34 +1,49 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-跑在 Pico 上：读本机 RS232 数据口 → 提取时间、三种气体和经纬度 → 写 LoRa 串口发出
-帧格式: $MIRA,<序号>,<时间戳>,<CH4>,<H2O>,<C2H6>,<Latitude>,<Longitude>
-经纬度缺失（nan / No Data / 空值）统一发送 nan
-带序号是为了地面站能统计丢包率（干扰测试要用）
+Pico 气体数据 → LoRa，后台可选 USB GPS 提供经纬度与高程。
+帧格式: $MIRA,<序号>,<时间戳>,<CH4>,<H2O>,<C2H6>,<纬度>,<经度>,<高程>
+高程为 GGA 的平均海平面海拔（米）；缺测统一发送 nan。
+无 GPS 时继续发送气体，位置回退到仪器第 16/17 列，高程为 nan。
 
-用法：
-  python3 pico_ch4_bridge.py --dry-run    # 只解析打印，不发送（先验证列对不对）
-  python3 pico_ch4_bridge.py              # 正式运行
+python3 pico_ch4_bridge.py --dry-run   # 只解析打印，不发送
+python3 pico_ch4_bridge.py --gps-test  # 只测 GPS，不打开气体/LoRa 口
+python3 pico_ch4_bridge.py --no-gps    # 不探测外接 GPS
 """
 
-import serial
-import time
-import sys
+import argparse
+import datetime
 import logging
 import math
-import datetime
+import os
+import tempfile
+import threading
+import time
 from logging.handlers import RotatingFileHandler
 
-SRC = '/dev/ttyUSB_RS232'    # Pico 数据口（用别名，防止端口漂移）
-DST = '/dev/ttyUSB_LORA'      # LoRa 模块口（udev 规则绑定的固定名）
-BAUD = 9600
-MAX_SOURCE_BYTES = 1024     # 完整仪器行通常不到 200 字节
+import serial
+from serial.tools import list_ports
 
-# 列索引（0 起）：0=TimeStamp, 6=CH4, 7=H2O, 8=C2H6, 15=Latitude, 16=Longitude
+SRC = '/dev/ttyUSB_RS232'
+DST = '/dev/ttyUSB_LORA'
+BAUD = 9600
+MAX_SOURCE_BYTES = 1024
+MAX_FRAME_BYTES = 121
 IDX_TS, IDX_CH4, IDX_H2O, IDX_C2H6 = 0, 6, 7, 8
 IDX_LAT, IDX_LON = 15, 16
 
-DRY_RUN = '--dry-run' in sys.argv
+GPS_CANDIDATES = [
+    '/dev/ttyGPS',
+    '/dev/serial/by-id/'
+    'usb-u-blox_AG_-_www.u-blox.com_u-blox_7_-_GPS_GNSS_Receiver-if00',
+]
+GPS_PORT = GPS_CANDIDATES
+GPS_BAUD = 9600
+GPS_BAUDS = (GPS_BAUD, 4800, 38400, 115200)
+GPS_MAX_AGE = 10           # 定位/高程分别计时，过期后不能继续当作实时测量
+GPS_PROBE_SEC = 8
+GPS_RETRY_SEC = 10
+MAX_NMEA_BYTES = 256
 
 
 def sensor_time(value):
@@ -41,15 +56,13 @@ def sensor_time(value):
 
 
 def gas_value(value):
-    """缺测值不丢整行；保留有效浓度（包括 0 和高值）的原始精度。"""
+    """保持远程版的缺测处理及有效浓度精度。"""
     if value.lower() in ('', 'nan', 'no data'):
         return 'nan'
-    number = float(value)  # 其他非数字视为格式损坏，不当作测量值
-    return value if math.isfinite(number) else 'nan'
+    return value if math.isfinite(float(value)) else 'nan'
 
 
 def coordinate(value):
-    """保留有效坐标的原始精度；无定位或无效值统一为 nan。"""
     value = value.strip()
     try:
         if math.isfinite(float(value)):
@@ -59,13 +72,195 @@ def coordinate(value):
     return 'nan'
 
 
+def dm2dd(dm, hemi):
+    """NMEA 度分转十进制度，拒绝错误半球、越界坐标及非有限值。"""
+    hemi = hemi.upper()
+    if hemi not in ('N', 'S', 'E', 'W'):
+        return None
+    try:
+        value = float(dm)
+    except ValueError:
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    deg = int(value // 100)
+    minutes = value - deg * 100
+    limit = 90 if hemi in ('N', 'S') else 180
+    if minutes >= 60 or deg > limit or (deg == limit and minutes != 0):
+        return None
+    dd = deg + minutes / 60
+    return -dd if hemi in ('S', 'W') else dd
+
+
+def nmea_valid(line):
+    if not line.startswith('$') or '*' not in line:
+        return False
+    body, chk = line[1:].rsplit('*', 1)
+    if len(chk) != 2:
+        return False
+    calc = 0
+    for char in body:
+        calc ^= ord(char)
+    try:
+        return int(chk, 16) == calc
+    except ValueError:
+        return False
+
+
+def parse_gga(p):
+    """GGA 高程为 MSL 海拔（米），不是椭球高或离地高度。"""
+    if len(p) < 11 or p[6] not in ('1', '2', '3', '4', '5', '6', '7', '8'):
+        return None
+    if p[3] not in ('N', 'S') or p[5] not in ('E', 'W'):
+        return None
+    lat, lon = dm2dd(p[2], p[3]), dm2dd(p[4], p[5])
+    if lat is None or lon is None:
+        return None
+    alt = coordinate(p[9]) if p[10] == 'M' else 'nan'
+    return lat, lon, None if alt == 'nan' else float(alt)
+
+
+def parse_rmc(p):
+    if len(p) < 7 or p[2] != 'A':
+        return None
+    if p[4] not in ('N', 'S') or p[6] not in ('E', 'W'):
+        return None
+    lat, lon = dm2dd(p[3], p[4]), dm2dd(p[5], p[6])
+    return None if lat is None or lon is None else (lat, lon, None)
+
+
+class GpsReader(threading.Thread):
+    def __init__(self, port=None):
+        super().__init__(daemon=True)
+        self.port = port
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.lat = self.lon = self.alt = None
+        self.fix_time = self.alt_time = None
+        self.sats = 0
+
+    def stop(self):
+        self.stop_event.set()
+
+    def get(self):
+        now = time.monotonic()
+        with self.lock:
+            if self.fix_time is None or now - self.fix_time >= GPS_MAX_AGE:
+                return None, None, None
+            alt = self.alt if self.alt_time is not None and now - self.alt_time < GPS_MAX_AGE else None
+            return self.lat, self.lon, alt
+
+    def status(self):
+        with self.lock:
+            fresh = self.fix_time is not None and time.monotonic() - self.fix_time < GPS_MAX_AGE
+            return f'卫星{self.sats} 定位' + ('正常' if fresh else '缺失/过期')
+
+    def _clear(self):
+        with self.lock:
+            self.lat = self.lon = self.alt = None
+            self.fix_time = self.alt_time = None
+            self.sats = 0
+
+    def _candidate_ports(self):
+        """只探测指定别名或 USB u-blox；绝不盲扫气体口/LoRa 口。"""
+        infos = list(list_ports.comports())
+        wish = [self.port] if isinstance(self.port, str) else (self.port or [])
+        candidates = [p for p in wish if os.path.exists(p)]
+        candidates.extend(p.device for p in infos if p.vid == 0x1546)
+        reserved = {os.path.realpath(SRC), os.path.realpath(DST)}
+        seen, result = set(), []
+        for path in candidates:
+            real = os.path.realpath(path)
+            info = next((p for p in infos if os.path.realpath(p.device) == real), None)
+            if real in reserved or real in seen or (info and info.vid not in (None, 0x1546)):
+                continue
+            seen.add(real)
+            result.append(path)
+        return result
+
+    def _consume(self, line):
+        """有效的无定位语句也能识别设备；丢失定位立即清除旧值。"""
+        if not nmea_valid(line):
+            return False
+        p = line[1:].split('*', 1)[0].split(',')
+        kind = p[0][-3:]
+        if kind not in ('GGA', 'RMC'):
+            return False
+        if (kind == 'GGA' and len(p) > 6 and p[6] == '0') or (
+                kind == 'RMC' and len(p) > 2 and p[2] == 'V'):
+            self._clear()
+            return True
+        result = parse_gga(p) if kind == 'GGA' else parse_rmc(p)
+        if result is not None:
+            now = time.monotonic()
+            with self.lock:
+                self.lat, self.lon = result[:2]
+                self.fix_time = now
+                if kind == 'GGA':
+                    self.alt = result[2]
+                    self.alt_time = now if self.alt is not None else None
+                    self.sats = int(p[7]) if p[7].isdigit() else 0
+        return True
+
+    def _read_port(self, port, baud):
+        with serial.Serial(port, baud, timeout=1, exclusive=True) as stream:
+            pending, discarding = b'', False
+            last_sentence = time.monotonic()
+            locked = False
+            while not self.stop_event.is_set():
+                timeout = GPS_MAX_AGE if locked else GPS_PROBE_SEC
+                if time.monotonic() - last_sentence >= timeout:
+                    return
+                raw = stream.readline(MAX_NMEA_BYTES + 1)
+                if not raw:
+                    continue
+                if discarding:
+                    discarding = not raw.endswith(b'\n')
+                    continue
+                pending += raw
+                if len(pending) > MAX_NMEA_BYTES:
+                    pending, discarding = b'', not raw.endswith(b'\n')
+                    continue
+                if not pending.endswith(b'\n'):
+                    continue
+                line, pending = pending, b''
+                try:
+                    valid = self._consume(line.decode('ascii').strip())
+                except UnicodeDecodeError:
+                    valid = False
+                if valid:
+                    last_sentence = time.monotonic()
+                    if not locked:
+                        locked = True
+                        logging.info('GPS detected %s @%d', port, baud)
+                        print(f'[GPS] 已识别 {port}@{baud}', flush=True)
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                for port in self._candidate_ports():
+                    for baud in GPS_BAUDS:
+                        if self.stop_event.is_set():
+                            return
+                        try:
+                            self._read_port(port, baud)
+                        except (serial.SerialException, OSError) as e:
+                            logging.info('GPS %s @%d: %s', port, baud, e)
+                        finally:
+                            self._clear()
+            except (serial.SerialException, OSError) as e:
+                logging.warning('GPS discovery: %s', e)
+            # 没插 GPS 时此线程等待，气体收发线程照常运行；支持稍后插入。
+            self.stop_event.wait(GPS_RETRY_SEC)
+
+
 def open_port(path):
     while True:
         try:
-            s = serial.Serial(path, BAUD, timeout=1, write_timeout=2)
+            stream = serial.Serial(path, BAUD, timeout=1, write_timeout=2)
             logging.info('opened %s', path)
-            return s
-        except Exception as e:
+            return stream
+        except (serial.SerialException, OSError) as e:
             logging.warning('%s: %s, retry 2s', path, e)
             time.sleep(2)
 
@@ -79,7 +274,7 @@ def parse(line):
     if not txt:
         return None
     p = [x.strip() for x in txt.split(',')]
-    if len(p) != IDX_LON + 1:  # 仪器完整行应为 17 列，拒绝缺列或拼接错位的行
+    if len(p) != IDX_LON + 1:
         logging.warning('source field count is %d, expected 17', len(p))
         return None
     if p[IDX_TS] == 'Time Stamp':
@@ -91,24 +286,62 @@ def parse(line):
     except ValueError:
         logging.warning('invalid source timestamp or gas value: %s', txt)
         return None
-    lat = coordinate(p[IDX_LAT])
-    lon = coordinate(p[IDX_LON])
-    return ts, ch4, h2o, c2h6, lat, lon
+    return ts, ch4, h2o, c2h6, coordinate(p[IDX_LAT]), coordinate(p[IDX_LON])
 
 
-def main():
+def fmt(value, nd=6):
+    return f'{value:.{nd}f}' if value is not None and math.isfinite(value) else 'nan'
+
+
+def build_frame(seq, reading, gps):
+    ts, ch4, h2o, c2h6, lat, lon = reading
+    gps_lat, gps_lon, alt = gps.get() if gps else (None, None, None)
+    if gps_lat is not None and gps_lon is not None:
+        lat, lon = fmt(gps_lat), fmt(gps_lon)
+    frame = '$MIRA,%d,%s,%s,%s,%s,%s,%s,%s\n' % (
+        seq, ts, ch4, h2o, c2h6, lat, lon, fmt(alt, 1))
+    payload = frame.encode('ascii')
+    if len(payload) > MAX_FRAME_BYTES:
+        logging.warning('frame exceeds 121 bytes, skipped: %s', frame.strip())
+        return None  # 不截断测量值，不产生缺列或错误的有效数字
+    return payload
+
+
+def close_ports(*ports):
+    for port in ports:
+        if port is not None:
+            try:
+                port.close()
+            except Exception:
+                logging.exception('serial close failed')
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--dry-run', action='store_true')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--gps-test', action='store_true')
+    mode.add_argument('--no-gps', action='store_true')
+    args = parser.parse_args(argv)
     logging.basicConfig(
-        handlers=[RotatingFileHandler('/tmp/ch4_bridge.log', maxBytes=1024 * 1024,
-                                      backupCount=2)],
+        handlers=[RotatingFileHandler(os.path.join(tempfile.gettempdir(), 'ch4_bridge.log'),
+                                      maxBytes=1024 * 1024, backupCount=2)],
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     src = dst = None
-    seq = 0
-    pending = b''
-    discarding = False
+    gps = None if args.no_gps else GpsReader(GPS_PORT)
+    seq, pending, discarding = 0, b'', False
     try:
+        if gps:
+            gps.start()
+        if args.gps_test:
+            print('仅测试 GPS，Ctrl+C 停止', flush=True)
+            while True:
+                lat, lon, alt = gps.get()
+                print(f'纬度 {fmt(lat)} 经度 {fmt(lon)} 高程 {fmt(alt, 1)} [{gps.status()}]', flush=True)
+                time.sleep(1)
         src = open_port(SRC)
-        dst = None if DRY_RUN else open_port(DST)
-        print('DRY RUN 只解析不发送' if DRY_RUN else '桥接已启动', flush=True)
+        dst = None if args.dry_run else open_port(DST)
+        print('DRY RUN 只解析不发送' if args.dry_run else '桥接已启动', flush=True)
         while True:
             try:
                 line = src.readline(MAX_SOURCE_BYTES + 1)
@@ -120,21 +353,18 @@ def main():
                 pending += line
                 if len(pending) > MAX_SOURCE_BYTES:
                     logging.warning('oversized source line discarded')
-                    pending = b''
-                    discarding = not line.endswith(b'\n')
+                    pending, discarding = b'', not line.endswith(b'\n')
                     continue
                 if not pending.endswith(b'\n'):
-                    continue  # readline 超时可能只返回半行，等到换行再解析
-                line, pending = pending, b''
-                r = parse(line)
-                if r is None:
                     continue
-                frame = "$MIRA,%d,%s,%s,%s,%s,%s,%s\n" % ((seq,) + r)
-                payload = frame.encode('ascii')
-                if len(payload) > 121:  # LoRa 单帧硬上限
-                    logging.warning('frame exceeds 121 bytes, skipped: %s', frame.strip())
-                    continue  # 不截断，否则可能把经纬度截成错误的有效数字
-                print(frame, end='', flush=True)
+                line, pending = pending, b''
+                reading = parse(line)
+                if reading is None:
+                    continue
+                payload = build_frame(seq, reading, gps)
+                if payload is None:
+                    continue
+                print(payload.decode('ascii'), end='', flush=True)
                 if dst:
                     if dst.write(payload) != len(payload):
                         raise serial.SerialException('incomplete LoRa serial write')
@@ -142,26 +372,18 @@ def main():
                 seq += 1
             except (serial.SerialException, OSError) as e:
                 logging.error('serial error: %s', e)
-                pending = b''
-                discarding = False
-                for port in (src, dst):
-                    if port is not None:
-                        try:
-                            port.close()
-                        except Exception:
-                            logging.exception('serial close failed')
+                pending, discarding = b'', False
+                close_ports(src, dst)
                 src = dst = None
                 src = open_port(SRC)
-                dst = None if DRY_RUN else open_port(DST)
+                dst = None if args.dry_run else open_port(DST)
     except KeyboardInterrupt:
         pass
     finally:
-        for port in (src, dst):
-            if port is not None:
-                try:
-                    port.close()
-                except Exception:
-                    logging.exception('serial close failed')
+        close_ports(src, dst)
+        if gps:
+            gps.stop()
+            gps.join(timeout=2)
 
 
 if __name__ == '__main__':

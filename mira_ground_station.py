@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 MIRA Pico 甲烷监测地面站 (Windows)
-替代 PuTTY 的专用接收软件：三气体实时曲线 / 数值卡 / 经纬度 / 自动存 CSV / 丢包统计
+替代 PuTTY 的专用接收软件：三气体实时曲线 / 数值卡 / 经纬度及高程 / 自动存 CSV / 丢包统计
 
 【数据输出】
   自动在程序所在文件夹下创建 data/ 子目录
@@ -499,7 +499,7 @@ class GroundStation:
         info = ttk.LabelFrame(left, text='状态', padding=8)
         info.pack(fill=tk.X, pady=4)
         self.info_vars = {}
-        for k in ('Pico时间', '纬度', '经度', '接收帧数', '丢包率', '速率', '运行时长', '当前文件'):
+        for k in ('Pico时间', '纬度', '经度', '高程(m)', '接收帧数', '丢包率', '速率', '运行时长', '当前文件'):
             row = ttk.Frame(info)
             row.pack(fill=tk.X)
             ttk.Label(row, text=k + ':', font=FONT, width=9).pack(side=tk.LEFT)
@@ -871,15 +871,15 @@ class GroundStation:
         if p[0] != '$MIRA' or len(p) < 2:
             self.log_msg(f'帧格式错误，已跳过: {line}')
             return
-        if p[1].isdigit():                         # $MIRA,seq,ts,ch4,h2o,c2h6[,lat,lon]
-            if len(p) not in (6, 8):
+        if p[1].isdigit():                         # $MIRA,seq,ts,ch4,h2o,c2h6[,lat,lon[,alt]]
+            if len(p) not in (6, 8, 9):
                 self.log_msg(f'帧字段数错误，已跳过: {line}')
                 return
             seq = int(p[1]); ts = p[2]; vals = p[3:6]
-            coords = p[6:8]
-        elif len(p) in (5, 7):                       # $MIRA,ts,ch4,h2o,c2h6[,lat,lon]
+            coords = p[6:]
+        elif len(p) in (5, 7, 8):                  # $MIRA,ts,ch4,h2o,c2h6[,lat,lon[,alt]]
             seq = None; ts = p[1]; vals = p[2:5]
-            coords = p[5:7]
+            coords = p[5:]
         else:
             self.log_msg(f'帧字段数错误，已跳过: {line}')
             return
@@ -906,6 +906,7 @@ class GroundStation:
 
         lat = coordinate(coords[0]) if coords else 'nan'
         lon = coordinate(coords[1]) if len(coords) > 1 else 'nan'
+        alt = coordinate(coords[2]) if len(coords) > 2 else 'nan'
 
         self.rx_count += 1
         self.timestamps.append(t_pc)
@@ -916,6 +917,7 @@ class GroundStation:
         self.info_vars['Pico时间'].set(ts)
         self.info_vars['纬度'].set(lat if lat != 'nan' else 'No Data')
         self.info_vars['经度'].set(lon if lon != 'nan' else 'No Data')
+        self.info_vars['高程(m)'].set(alt if alt != 'nan' else 'No Data')
 
         # 曲线数据
         self.time_data.append(t_pc - (self.t_start or t_pc))
@@ -934,7 +936,7 @@ class GroundStation:
             try:
                 self.csv_writer.writerow(
                     [datetime.datetime.fromtimestamp(t_pc).isoformat(),
-                     seq if seq is not None else '', ts] + vals + [lat, lon])
+                     seq if seq is not None else '', ts] + vals + [lat, lon, alt])
                 self.csv_file.flush()
             except (OSError, csv.Error) as e:
                 self.close_csv()
@@ -988,7 +990,7 @@ class GroundStation:
             self.csv_writer = csv.writer(self.csv_file)
             self.csv_writer.writerow(['pc_time', 'seq', 'pico_time',
                                       'CH4_ppm', 'H2O_ppm', 'C2H6_ppb',
-                                      'Latitude', 'Longitude'])
+                                      'Latitude', 'Longitude', 'Altitude_MSL_m'])
             self.csv_file.flush()
         except Exception as e:
             self.close_csv()

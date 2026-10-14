@@ -3,7 +3,7 @@ setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%~dp0"
 if errorlevel 1 goto workspace_failed
 
-REM Resolve one Python 3 interpreter and use it for checks, installs and startup.
+REM Resolve one Python 3.8+ interpreter and use it for checks, installs and startup.
 set "GS_PYTHON="
 call :find_python python
 if not defined GS_PYTHON call :find_python python3
@@ -32,7 +32,7 @@ if "%GS_TERMINAL_READY%"=="0" (
     echo [INFO] Monitoring, serial reception, plots and CSV saving will still start.
 )
 echo [INFO] Starting MIRA Ground Station...
-"%GS_PYTHON%" "mira_ground_station.py"
+"%GS_PYTHON%" -u "mira_ground_station.py"
 set "GS_EXIT_CODE=%errorlevel%"
 if "%GS_EXIT_CODE%"=="0" exit /b 0
 echo.
@@ -42,7 +42,7 @@ pause
 exit /b %GS_EXIT_CODE%
 
 :find_python
-%* -c "import sys; sys.exit(sys.version_info.major != 3)" >nul 2>&1
+%* -c "import sys; sys.exit(sys.version_info < (3, 8) or sys.version_info.major != 3)" >nul 2>&1
 if errorlevel 1 exit /b 0
 for /f "delims=" %%P in ('%* -c "import sys; print(sys.executable)" 2^>nul') do set "GS_PYTHON=%%P"
 exit /b 0
@@ -78,8 +78,8 @@ pause
 exit /b 1
 
 :python_failed
-echo [ERROR] Python 3 was not found.
-echo Install Python 3 and enable Add Python to PATH, then run this file again.
+echo [ERROR] Python 3.8 or newer was not found.
+echo Install Python 3.8+ with Tcl/Tk support and enable Add Python to PATH, then run this file again.
 pause
 exit /b 1
 
